@@ -630,33 +630,117 @@ constant half turbo_centroids_3bit_h[8] = {
      0.021460h,  0.065717h,  0.117832h,  0.190685h
 };
 
+// 4-entry magnitude LUT (positive values only, ascending order)
+// Used with ALU sign application to halve constant cache divergence
+constant half turbo_mag_3bit_h[4] = {
+    0.021460h, 0.065717h, 0.117832h, 0.190685h
+};
+
+// 2-entry PAIR LUT: each entry is a half2 containing two adjacent magnitudes.
+// Only 2 possible constant addresses per lookup (vs 4 for mag LUT, 8 for full).
+// bit1 selects the pair, bit0 selects within the pair via ternary.
+constant half2 turbo_mag_pairs_h[2] = {
+    half2(0.021460h, 0.065717h),   // pair 0: mag indices 0,1
+    half2(0.117832h, 0.190685h),   // pair 1: mag indices 2,3
+};
+
 // Vec: 4 elements per call (il ∈ {0..7}), returns type4
-// Register centroid×norm LUT — ported from @spiritbuun's CUDA implementation.
-// Precompute centroid[i]*norm into thread-local registers once per block,
-// then index into registers instead of hitting constant memory per element.
-// On CUDA this gave 96-97% decode speed vs q8_0 (up from ~88%).
+// Experiment: batched byte reads (ported from @spiritbuun's CUDA impl).
+// Read qs + signs bytes with minimal device memory accesses.
+// The signs byte covers 8 elements — read once, shift for each element.
+// Constant half[8] LUT for centroid lookup (proven fastest on Apple Silicon).
 template <typename type4>
 void dequantize_turbo3_0_t4(device const block_turbo3_0 * xb, short il, thread type4 & reg) {
-    const float norm = float(xb->norm);
+    // PROFILING MODE: controlled by TURBO_PROFILE_MODE compile flag
+    // 0 = full dequant (batched extract)
+    // 1 = no-op (return zeros) — decode ceiling without dequant cost
+    // 2 = norm only (read norm, return constant) — isolate norm read
+    // 3 = norm + qs only (skip signs) — isolate signs byte cost
+    // 4 = full dequant, skip LUT (use constant centroid) — isolate LUT cost
+#ifndef TURBO_PROFILE_MODE
+#define TURBO_PROFILE_MODE 0
+#endif
 
-    // Original 8-entry constant half LUT + float norm broadcast.
-    // Register LUT approach (cn[8] array) tested but caused register spill
-    // on Metal, making it slower than constant memory. Reverting to the
-    // proven approach from main branch: constant half LUT + float multiply.
-    // This is the fastest vec dequant on M5 Max (77.4 tok/s).
-    // Note: @spiritbuun's register LUT works great on CUDA (96-97% of q8_0)
-    // but Metal's register file handles it differently.
+#if TURBO_PROFILE_MODE == 1
+    // NO-OP: decode speed ceiling
+    reg = type4(0.0f);
+#elif TURBO_PROFILE_MODE == 2
+    // NORM ONLY: just read norm, return it as all 4 values
+    const float norm = float(xb->norm);
+    reg = type4(norm);
+#elif TURBO_PROFILE_MODE == 3
+    // NORM + QS: read norm and qs byte, skip signs
+    const float norm = float(xb->norm);
+    const uint8_t qb = xb->qs[il];
+    const uint8_t q0 = (qb      ) & 0x03;
+    const uint8_t q1 = (qb >> 2) & 0x03;
+    const uint8_t q2 = (qb >> 4) & 0x03;
+    const uint8_t q3 = (qb >> 6);
+    // Use qs without signs — just positive centroids
+    reg = type4(float4(
+        float(turbo_centroids_3bit_h[q0 + 4]),
+        float(turbo_centroids_3bit_h[q1 + 4]),
+        float(turbo_centroids_3bit_h[q2 + 4]),
+        float(turbo_centroids_3bit_h[q3 + 4])
+    ) * norm);
+#elif TURBO_PROFILE_MODE == 4
+    // SKIP LUT: read all bytes but use constant centroid value
+    const float norm = float(xb->norm);
+    const uint8_t qb = xb->qs[il];
+    const uint8_t sb = xb->signs[il >> 1];
+    // Pretend all elements are centroid 0 — isolates LUT indexing cost
+    reg = type4(float4(float(turbo_centroids_3bit_h[0])) * norm);
+#else
+    // MODE 0: 4-entry magnitude LUT + ALU sign (halves constant cache divergence)
+    // Only 4 possible constant addresses per lookup (vs 8 in full LUT).
+    // Sign applied via select() — no branch, just conditional negate.
+    // Correct sign mapping: sign=1 → +mag[qs], sign=0 → -mag[3-qs] (reversed)
+    const float norm = float(xb->norm);
     const uint8_t qb = xb->qs[il];
     const uint8_t sb = xb->signs[il >> 1];
     const int sshift = (il & 1) << 2;
 
-    float4 centroids = float4(half4(
-        turbo_centroids_3bit_h[(qb & 0x03)        | (((sb >> (sshift + 0)) & 1) << 2)],
-        turbo_centroids_3bit_h[((qb >> 2) & 0x03) | (((sb >> (sshift + 1)) & 1) << 2)],
-        turbo_centroids_3bit_h[((qb >> 4) & 0x03) | (((sb >> (sshift + 2)) & 1) << 2)],
-        turbo_centroids_3bit_h[((qb >> 6) & 0x03) | (((sb >> (sshift + 3)) & 1) << 2)]
+    const uint8_t q0 = (qb      ) & 0x03;
+    const uint8_t q1 = (qb >> 2) & 0x03;
+    const uint8_t q2 = (qb >> 4) & 0x03;
+    const uint8_t q3 = (qb >> 6);
+    const uint8_t s0 = (sb >> (sshift    )) & 1;
+    const uint8_t s1 = (sb >> (sshift + 1)) & 1;
+    const uint8_t s2 = (sb >> (sshift + 2)) & 1;
+    const uint8_t s3 = (sb >> (sshift + 3)) & 1;
+
+    // Auto-selected dequant path based on hardware.
+    // TURBO_USE_4MAG=1 (pre-M5): 4-entry magnitude LUT + XOR sign (+38-45% on M2)
+    // TURBO_USE_4MAG=0 (M5+): 8-entry full LUT (best on M5, 0.905x q8_0)
+#if TURBO_USE_4MAG
+    // 4-mag LUT (proven +38-45% on M2). See decode-speed-hardware-analysis.md
+    // for the full 12-approach experiment log.
+    const uint8_t mi0 = q0 ^ (s0 ? 0u : 0x3u);
+    const uint8_t mi1 = q1 ^ (s1 ? 0u : 0x3u);
+    const uint8_t mi2 = q2 ^ (s2 ? 0u : 0x3u);
+    const uint8_t mi3 = q3 ^ (s3 ? 0u : 0x3u);
+
+    const float v0 = float(turbo_mag_3bit_h[mi0]) * norm;
+    const float v1 = float(turbo_mag_3bit_h[mi1]) * norm;
+    const float v2 = float(turbo_mag_3bit_h[mi2]) * norm;
+    const float v3 = float(turbo_mag_3bit_h[mi3]) * norm;
+
+    reg = type4(float4(
+        s0 ? v0 : -v0,
+        s1 ? v1 : -v1,
+        s2 ? v2 : -v2,
+        s3 ? v3 : -v3
     ));
-    reg = type4(centroids * norm);
+#else
+    // 8-entry full LUT: best on M5 Max (0.905x q8_0, 77.4 tok/s)
+    reg = type4(float4(
+        float(turbo_centroids_3bit_h[q0 | (s0 << 2)]),
+        float(turbo_centroids_3bit_h[q1 | (s1 << 2)]),
+        float(turbo_centroids_3bit_h[q2 | (s2 << 2)]),
+        float(turbo_centroids_3bit_h[q3 | (s3 << 2)])
+    ) * norm);
+#endif
+#endif
 }
 
 // ----- turbo4 dequantize with per-thread block cache -----
@@ -7067,6 +7151,71 @@ kernel void kernel_flash_attn_ext_vec(
                     } else {
                         device const kd4_t * pk = (device const kd4_t *) (k + ((ic + NE*cc + ty)*args.nb11));
 
+#if TURBO_USE_4MAG && TURBO_FUSED_BLOCK_DOT
+                        // FUSED BLOCK DOT: flip computation order.
+                        // Instead of per-element: score += centroid[idx] * norm * Q[j]
+                        // Do per-centroid: score += mag[c] * norm * sum(Q[j] where mi[j]==c)
+                        //
+                        // 4 centroid iterations × masked Q accumulation replaces
+                        // 32 per-element constant memory lookups.
+                        // float(mi==c) is branchless on Apple GPU (comparison → 0/1).
+                        {
+                        FOR_UNROLL (short ii = 0; ii < DK4/NL; ++ii) {
+                            const short i = ii*NL + tx;
+                            const short blk_idx = i / nl_k;
+                            const short il = i % nl_k;
+
+                            device const block_turbo3_0 * xb = ((device const block_turbo3_0 *)pk) + blk_idx;
+                            const float norm = float(xb->norm);
+                            const uint8_t qb = xb->qs[il];
+                            const uint8_t sb = xb->signs[il >> 1];
+                            const int sshift = (il & 1) << 2;
+
+                            // Extract magnitude indices (with XOR sign reversal)
+                            const uint8_t s0 = (sb >> (sshift    )) & 1;
+                            const uint8_t s1 = (sb >> (sshift + 1)) & 1;
+                            const uint8_t s2 = (sb >> (sshift + 2)) & 1;
+                            const uint8_t s3 = (sb >> (sshift + 3)) & 1;
+
+                            const uint mi0 = uint((qb      ) & 0x03) ^ (s0 ? 0u : 3u);
+                            const uint mi1 = uint((qb >> 2) & 0x03) ^ (s1 ? 0u : 3u);
+                            const uint mi2 = uint((qb >> 4) & 0x03) ^ (s2 ? 0u : 3u);
+                            const uint mi3 = uint((qb >> 6)       ) ^ (s3 ? 0u : 3u);
+
+                            // Sign multipliers (branchless: 2*s - 1)
+                            const float sg0 = 2.0f * float(s0) - 1.0f;
+                            const float sg1 = 2.0f * float(s1) - 1.0f;
+                            const float sg2 = 2.0f * float(s2) - 1.0f;
+                            const float sg3 = 2.0f * float(s3) - 1.0f;
+
+                            // Q values for this thread's 4 elements
+                            const float4 qv = (float4) sq4[i];
+
+                            // Accumulate per-centroid: for each magnitude c,
+                            // sum Q[j]*sign[j] where mi[j]==c
+                            // float(mi==c) is 0.0 or 1.0 — branchless comparison
+                            float score = 0.0f;
+                            for (uint c = 0; c < 4; c++) {
+                                float signed_q_sum =
+                                    qv.x * sg0 * float(mi0 == c) +
+                                    qv.y * sg1 * float(mi1 == c) +
+                                    qv.z * sg2 * float(mi2 == c) +
+                                    qv.w * sg3 * float(mi3 == c);
+
+                                // ONE constant read per centroid (shared across all elements)
+                                score += float(turbo_mag_3bit_h[c]) * signed_q_sum;
+                            }
+
+                            mqk[cc] += score * norm;
+                        }
+                        }
+                        // Each iteration, 8 threads share a block (NL=8 for turbo3).
+                        // Threads 0-3 within the block each hold one mag×norm value.
+                        // Other threads use simd_shuffle to read the right value by mi index.
+                        //
+                        // This eliminates BOTH constant memory AND branches from the inner loop.
+                        // The shuffle is a single-cycle cross-lane operation.
+#else
                         k4_t mk;
 
                         FOR_UNROLL (short ii = 0; ii < DK4/NL; ++ii) {
@@ -7076,6 +7225,7 @@ kernel void kernel_flash_attn_ext_vec(
 
                             mqk[cc] += dot((float4) mk, (float4) sq4[i]);
                         }
+#endif
                     }
 
                     if (NE == 1) {
@@ -7176,6 +7326,13 @@ kernel void kernel_flash_attn_ext_vec(
                     }
                 } else {
                     FOR_UNROLL (short cc = 0; cc < C/NE; ++cc) {
+#if TURBO_SPARSE_V
+                        // SPARSE V DEQUANT: skip V for positions with negligible attention weight.
+                        // At 32K context, ~90%+ of attention weights are near zero.
+                        // Skipping their V dequant saves ~50% of total dequant cost.
+                        const float attn_weight = float(ss[NE*cc + ty]);
+                        if (attn_weight < 1e-6f) continue;  // skip negligible positions
+#endif
                         device const vd4_t * pv4 = (device const vd4_t *) (v + ((ic + NE*cc + ty)*args.nb21));
 
                         FOR_UNROLL (short ii = 0; ii < DV4/NL; ++ii) {
